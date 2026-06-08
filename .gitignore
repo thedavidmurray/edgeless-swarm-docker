@@ -1,0 +1,49 @@
+# Swarm-in-a-Box Git Ignore
+# =========================
+
+# Secrets
+.env
+.env.local
+.env.*.local
+
+# Hermes data (bind-mounted, never commit)
+.hermes/
+.hermes_backup/
+
+# Hermes agent source (cloned during setup)
+hermes-agent/
+
+# Docker volumes
+chroma-data/
+paperclip-data/
+
+# Logs
+*.log
+logs/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.egg-info/
+.venv/
+venv/
+
+# Node
+node_modules/
+dist/
+
+# Temporary
+*.tmp
+*.bak
+*~

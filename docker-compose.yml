@@ -1,0 +1,299 @@
+# Swarm-in-a-Box — Edgeless Multi-Agent Swarm Docker Compose
+# ============================================================
+# Product-grade containerization for the Edgeless swarm.
+# Services: Hermes gateway, Paperclip API, ChromaDB, multi-profile agent runner,
+# cron scheduler, and health checks.
+#
+# Quick start:
+#   1. cp docker/.env.example .env
+#   2. Edit .env with your API keys and paths
+#   3. ./docker/setup.sh
+#   4. docker compose up -d
+#
+# Architecture notes:
+#   - All services attach to `swarm-net` (isolated bridge) except the gateway
+#     which also publishes platform ports (Discord/Telegram/API).
+#   - Profiles are mounted from ~/.hermes/profiles/ into /opt/data/profiles/.
+#   - ChromaDB persists to a named volume; index snapshots can be bind-mounted.
+#   - The agent-runner spawns per-profile supervised processes via s6-overlay.
+#   - Cron is built into the Hermes gateway; no separate cron container needed.
+#
+# Security:
+#   - Dashboard binds to 127.0.0.1 by default. Expose via reverse proxy only.
+#   - API server requires API_SERVER_KEY when exposed beyond localhost.
+#   - .env files are chmod 600 inside the container via stage2-hook.
+#   - Do NOT commit .env to git.
+
+name: edgeless-swarm
+
+services:
+  # ---------------------------------------------------------------------------
+  # ChromaDB — Vector store for embeddings, memory, and knowledge retrieval
+  # ---------------------------------------------------------------------------
+  chroma:
+    image: chromadb/chroma:latest
+    container_name: swarm-chroma
+    restart: unless-stopped
+    networks:
+      - swarm-net
+    volumes:
+      - chroma-data:/chroma/chroma
+    environment:
+      - CHROMA_SERVER_HOST=0.0.0.0
+      - CHROMA_SERVER_PORT=8000
+      - CHROMA_SERVER_CORS_ALLOW_ORIGINS=["*"]
+      - ANONYMIZED_TELEMETRY=false
+      - PERSIST_DIRECTORY=/chroma/chroma
+      - IS_PERSISTENT=TRUE
+    ports:
+      - "${CHROMA_HOST_PORT:-8000}:8000"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:8000/api/v1/heartbeat"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
+    deploy:
+      resources:
+        limits:
+          memory: ${CHROMA_MEMORY_LIMIT:-2G}
+        reservations:
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # Paperclip API — Task / issue tracker (self-hosted or external)
+  # ---------------------------------------------------------------------------
+  paperclip:
+    build:
+      context: ./docker/paperclip
+      dockerfile: Dockerfile
+    image: swarm-paperclip
+    container_name: swarm-paperclip
+    restart: unless-stopped
+    networks:
+      - swarm-net
+    volumes:
+      - paperclip-data:/data
+      - ./docker/paperclip:/app/config:ro
+    environment:
+      - PAPERCLIP_PORT=3100
+      - PAPERCLIP_BIND=0.0.0.0
+      - PAPERCLIP_DATA_DIR=/data
+      - PAPERCLIP_COMPANY_ID=${PAPERCLIP_COMPANY_ID:-}
+      - PAPERCLIP_API_KEY=${PAPERCLIP_API_KEY:-}
+      - CHROMA_URL=http://chroma:8000
+    ports:
+      - "${PAPERCLIP_HOST_PORT:-3100}:3100"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://localhost:3100/api/health"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    depends_on:
+      chroma:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: ${PAPERCLIP_MEMORY_LIMIT:-512M}
+
+  # ---------------------------------------------------------------------------
+  # Hermes Gateway — Discord + Telegram + API server + cron scheduler
+  # ---------------------------------------------------------------------------
+  gateway:
+    build:
+      context: ${HERMES_AGENT_PATH:-./hermes-agent}
+      dockerfile: Dockerfile
+      args:
+        HERMES_GIT_SHA: ${HERMES_GIT_SHA:-}
+    image: hermes-agent:swarm
+    container_name: swarm-gateway
+    restart: unless-stopped
+    networks:
+      - swarm-net
+    ports:
+      - "${GATEWAY_API_PORT:-8080}:8080"
+    volumes:
+      - type: bind
+        source: ${HERMES_HOME:-~/.hermes}
+        target: /opt/data
+      - type: bind
+        source: ${HERMES_PROFILES:-~/.hermes/profiles}
+        target: /opt/data/profiles
+        bind:
+          create_host_path: true
+      - type: bind
+        source: ./docker
+        target: /opt/hermes/docker
+        read_only: true
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      - HERMES_HOME=/opt/data
+      - HERMES_GATEWAY_BOOTSTRAP_STATE=running
+      - API_SERVER_HOST=${API_SERVER_HOST:-0.0.0.0}
+      - API_SERVER_KEY=${API_SERVER_KEY:-}
+      - CHROMA_URL=http://chroma:8000
+      - PAPERCLIP_URL=http://paperclip:3100
+      - DISCORD_BOT_TOKEN=${DISCORD_BOT_TOKEN:-}
+      - TELEGRAM_BOT_TOKEN=${TELEGRAM_BOT_TOKEN:-}
+      - TELEGRAM_ALLOWED_USERS=${TELEGRAM_ALLOWED_USERS:-}
+      - FIREWORKS_API_KEY=${FIREWORKS_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - HERMES_AUTH_JSON_BOOTSTRAP=${HERMES_AUTH_JSON_BOOTSTRAP:-}
+      # NAS aliases
+      - PUID=${HERMES_UID:-}
+      - PGID=${HERMES_GID:-}
+    command: ["gateway", "run", "--replace"]
+    healthcheck:
+      test: ["CMD-SHELL", "bash /opt/hermes/docker/healthcheck-gateway.sh || curl -fsS http://localhost:8080/health || test -f /opt/data/gateway_state.json && grep -q 'running' /opt/data/gateway_state.json"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 60s
+    depends_on:
+      chroma:
+        condition: service_healthy
+      paperclip:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: ${GATEWAY_MEMORY_LIMIT:-2G}
+        reservations:
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # Multi-Profile Agent Runner — Runs swarm specialists as supervised agents
+  # ---------------------------------------------------------------------------
+  # Spawns one Hermes process per profile listed in docker/profiles.txt.
+  # Profiles: hive (coordinator), beau (research), scribe (knowledge),
+  # edgeless-cc (architecture), kilo (code execution), etc.
+  # Each profile loads its own config.yaml, skills, cron, and memory.
+  # ---------------------------------------------------------------------------
+  agent-runner:
+    image: hermes-agent:swarm
+    container_name: swarm-agent-runner
+    restart: unless-stopped
+    networks:
+      - swarm-net
+    volumes:
+      - type: bind
+        source: ${HERMES_HOME:-~/.hermes}
+        target: /opt/data
+      - type: bind
+        source: ${HERMES_PROFILES:-~/.hermes/profiles}
+        target: /opt/data/profiles
+        bind:
+          create_host_path: true
+      - type: bind
+        source: ./docker
+        target: /opt/hermes/docker
+        read_only: true
+      - type: bind
+        source: ./docker/profiles.txt
+        target: /etc/swarm/profiles.txt
+        read_only: true
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      - HERMES_HOME=/opt/data
+      - CHROMA_URL=http://chroma:8000
+      - PAPERCLIP_URL=http://paperclip:3100
+      - FIREWORKS_API_KEY=${FIREWORKS_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      - ANTHROPIC_API_KEY=${ANTHROPIC_API_KEY:-}
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - HERMES_RUN_PROFILES=/etc/swarm/profiles.txt
+      - PUID=${HERMES_UID:-}
+      - PGID=${HERMES_GID:-}
+    command: ["sh", "-c", "exec /opt/hermes/docker/profile-runner.sh"]
+    healthcheck:
+      test: ["CMD-SHELL", "bash /opt/hermes/docker/healthcheck-profiles.sh || test -f /tmp/swarm-profiles-active"]
+      interval: 60s
+      timeout: 10s
+      retries: 3
+      start_period: 120s
+    depends_on:
+      gateway:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: ${AGENT_RUNNER_MEMORY_LIMIT:-4G}
+        reservations:
+          memory: 1G
+
+  # ---------------------------------------------------------------------------
+  # Dashboard — Web UI for swarm status, logs, and agent control
+  # ---------------------------------------------------------------------------
+  dashboard:
+    image: hermes-agent:swarm
+    container_name: swarm-dashboard
+    restart: unless-stopped
+    networks:
+      - swarm-net
+    volumes:
+      - type: bind
+        source: ${HERMES_HOME:-~/.hermes}
+        target: /opt/data
+    environment:
+      - HERMES_UID=${HERMES_UID:-10000}
+      - HERMES_GID=${HERMES_GID:-10000}
+      - HERMES_HOME=/opt/data
+      - PUID=${HERMES_UID:-}
+      - PGID=${HERMES_GID:-}
+    ports:
+      - "127.0.0.1:${DASHBOARD_PORT:-9119}:9119"
+    command: ["dashboard", "--host", "0.0.0.0", "--port", "9119", "--no-open"]
+    depends_on:
+      gateway:
+        condition: service_healthy
+    deploy:
+      resources:
+        limits:
+          memory: 512M
+
+  # ---------------------------------------------------------------------------
+  # Watchtower — Optional: auto-update swarm images (disable if unstable)
+  # ---------------------------------------------------------------------------
+  watchtower:
+    image: containrrr/watchtower:latest
+    container_name: swarm-watchtower
+    restart: unless-stopped
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    environment:
+      - WATCHTOWER_CLEANUP=true
+      - WATCHTOWER_POLL_INTERVAL=3600
+      - WATCHTOWER_LABEL_ENABLE=true
+      - WATCHTOWER_INCLUDE_STOPPED=true
+      - WATCHTOWER_ROLLING_RESTART=true
+      - WATCHTOWER_NOTIFICATIONS=shoutrrr
+      - WATCHTOWER_NOTIFICATION_URL=${WATCHTOWER_NOTIFICATION_URL:-}
+    labels:
+      - "com.centurylinklabs.watchtower.enable=true"
+    profiles:
+      - auto-update
+
+networks:
+  swarm-net:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.30.0.0/16
+    labels:
+      - "com.edgeless.swarm.network=true"
+
+volumes:
+  chroma-data:
+    driver: local
+    labels:
+      - "com.edgeless.swarm.volume=chroma"
+  paperclip-data:
+    driver: local
+    labels:
+      - "com.edgeless.swarm.volume=paperclip"

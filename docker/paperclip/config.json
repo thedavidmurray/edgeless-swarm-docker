@@ -1,0 +1,10 @@
+{
+  "company_id": "c5ea22fb-99d2-46a1-87c6-e7fc1ab0d712",
+  "prefix": "EDGA",
+  "default_project": "edgeless-swarm",
+  "features": {
+    "webhooks": false,
+    "slack_notifications": false,
+    "discord_notifications": false
+  }
+}
