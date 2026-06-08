@@ -1,3 +1,4 @@
+<<<<<<< HEAD
 # Swarm-in-a-Box
 
 > Product-grade Docker containerization for the Edgeless multi-agent swarm.
@@ -300,3 +301,7 @@ docker compose up -d
 ## License
 
 MIT — same as [hermes-agent](https://github.com/NousResearch/hermes-agent).
+=======
+# edgeless-swarm-docker
+Swarm-in-a-Box: Docker containerization for Edgeless multi-agent OS
+>>>>>>> db3a78bb4ab235aba3eeb8c63126c73451e59a38
